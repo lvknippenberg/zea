@@ -299,6 +299,63 @@ class VerasonicsFile(h5py.File):
 
         return self.sound_speed / self.probe.center_frequency
 
+    def read_receive_bufnums(self):
+        """Read the (0-based) RF buffer index for every ``Receive`` entry.
+
+        Each ``Receive`` structure has a ``bufnum`` field (see the Vantage
+        Sequence Programming Manual, "The Receive Object") that specifies which
+        ``RcvData{bufnum}`` / ``Resource.RcvBuffer(bufnum)`` buffer the
+        acquisition is stored in. Verasonics uses 1-based buffer numbers; this
+        helper returns them 0-based so they can be compared directly against the
+        ``buffer_index`` argument used throughout this converter.
+
+        Returns:
+            np.ndarray: Integer array of shape ``(n_receive,)`` with the 0-based
+            buffer index of each ``Receive`` entry. If the file has no
+            ``bufnum`` field (single-buffer legacy data), an all-zeros array is
+            returned so that every receive maps to ``buffer_index == 0``.
+        """
+        if "bufnum" not in self["Receive"]:
+            # Older single-buffer files may not store bufnum; assume buffer 0.
+            # Derive the receive count from any always-present Receive field
+            # (startDepth is required; endSample is added by VSX and may be
+            # absent in reduced/exported workspaces).
+            for field in ("startDepth", "endDepth", "mode", "framenum"):
+                if field in self["Receive"]:
+                    n_receive = self.get_reference_size(self["Receive"][field])
+                    return np.zeros(n_receive, dtype=np.int64)
+            raise KeyError(
+                "Could not determine the number of Receive entries: none of the "
+                "expected Receive fields (bufnum, startDepth, endDepth, mode, "
+                "framenum) are present."
+            )
+
+        bufnums = self.dereference_all(self["Receive"]["bufnum"])
+        # Each dereferenced element is a (1, 1) array; flatten to a scalar and
+        # convert from 1-based (Verasonics) to 0-based indexing.
+        bufnums = np.array([int(np.asarray(b).item()) - 1 for b in bufnums], dtype=np.int64)
+        return bufnums
+
+    def receive_indices_for_buffer(self, buffer_index=0):
+        """Indices into the ``Receive`` array that belong to ``buffer_index``.
+
+        Args:
+            buffer_index (int, optional): The 0-based RF buffer to select.
+                Defaults to 0.
+
+        Returns:
+            np.ndarray: Sorted integer array of ``Receive`` indices whose
+            ``bufnum`` matches ``buffer_index``.
+        """
+        bufnums = self.read_receive_bufnums()
+        indices = np.flatnonzero(bufnums == buffer_index)
+        if indices.size == 0:
+            raise ValueError(
+                f"No Receive entries found for buffer_index={buffer_index}. "
+                f"Available buffers (0-based): {sorted(np.unique(bufnums).tolist())}."
+            )
+        return indices
+
     def read_transmit_events(self, frames="all", allow_accumulate=False, buffer_index=0):
         """Read the events from the file and finds the order in which transmits and receives
         appear in the events.
@@ -330,6 +387,12 @@ class VerasonicsFile(h5py.File):
 
         frame_indices = self.get_frame_indices(frames, buffer_index)
 
+        # Buffer index (0-based) of every Receive entry. Only events whose
+        # receive belongs to the selected buffer are considered, so that files
+        # containing multiple RF buffers (e.g. RcvData{1} and RcvData{2}) are
+        # handled by selecting a single buffer.
+        receive_bufnums = self.read_receive_bufnums()
+
         for i in range(num_events):
             # Get the tx
             event_tx = self.dereference_index(self["Event"]["tx"], i)
@@ -351,6 +414,12 @@ class VerasonicsFile(h5py.File):
             # Subtract one to make the indices 0-based
             event_tx -= 1
             event_rcv -= 1
+
+            # Skip events whose receive is not stored in the selected RF buffer.
+            # This ensures that only the transmit/receive (and the corresponding
+            # seq_control) belonging to `buffer_index` are used.
+            if receive_bufnums[event_rcv] != buffer_index:
+                continue
 
             # Read mode
             mode = self.dereference_index(self["Receive"]["mode"], event_rcv)
@@ -389,7 +458,6 @@ class VerasonicsFile(h5py.File):
         tx_order = np.stack(tx_order)
         rcv_order = np.stack(rcv_order)
         time_to_next_acq = np.stack(time_to_next_acq)
-        time_to_next_acq = np.reshape(time_to_next_acq, (-1, tx_order.size))
 
         if np.any(modes == 1) and not allow_accumulate:
             raise ValueError(
@@ -410,8 +478,25 @@ class VerasonicsFile(h5py.File):
             log.info("Dropping time to next acquisition for accumulate mode transmits.")
             time_to_next_acq = None
 
+        # Reshape the per-transmit times into (n_frames, n_tx). Do this only when
+        # time_to_next_acq survived the accumulate handling above, and only when
+        # the total count divides evenly by the number of transmits per frame.
+        # A non-even count can occur for buffers with a non-uniform transmit
+        # structure across frames; in that case we drop the timing rather than
+        # crash on an invalid reshape.
         if time_to_next_acq is not None:
-            time_to_next_acq = time_to_next_acq[frame_indices]
+            n_tx = tx_order.size
+            if n_tx > 0 and time_to_next_acq.size % n_tx == 0:
+                time_to_next_acq = np.reshape(time_to_next_acq, (-1, n_tx))
+                time_to_next_acq = time_to_next_acq[frame_indices]
+            else:
+                log.warning(
+                    "Could not reshape time_to_next_acq "
+                    f"({time_to_next_acq.size} values) into frames of {n_tx} "
+                    "transmits; the transmit structure is not uniform across "
+                    "frames for this buffer. Dropping time-to-next-acquisition."
+                )
+                time_to_next_acq = None
 
         return tx_order, rcv_order, time_to_next_acq
 
@@ -449,14 +534,25 @@ class VerasonicsFile(h5py.File):
 
         return t0_delays, apodizations
 
-    @property
-    def sampling_frequency(self):
-        """The sampling frequency in Hz from the file."""
+    def get_sampling_frequency(self, buffer_index=None):
+        """The sampling frequency in Hz from the file.
+
+        Args:
+            buffer_index (int, optional): If given, read the sampling frequency
+                from the first receive event of this (0-based) RF buffer, so that
+                files with multiple buffers use the correct buffer. If ``None``
+                (default), the first receive event overall is used.
+        """
+        # Index of the receive event to read the (decim) sample rate from.
+        rcv_idx = 0
+        if buffer_index is not None:
+            rcv_idx = int(self.receive_indices_for_buffer(buffer_index)[0])
+
         # Read the sampling frequency from the file
-        adc_rate = self.dereference_index(self["Receive"]["decimSampleRate"], 0)
+        adc_rate = self.dereference_index(self["Receive"]["decimSampleRate"], rcv_idx)
 
         if "quadDecim" in self["Receive"]:
-            quaddecim = self.dereference_index(self["Receive"]["quadDecim"], 0)
+            quaddecim = self.dereference_index(self["Receive"]["quadDecim"], rcv_idx)
         else:
             # TODO: Verify if this is correct.
             # On the Vantage NXT the quadDecim field is missing. It seems that it should be
@@ -466,12 +562,17 @@ class VerasonicsFile(h5py.File):
         sampling_frequency = adc_rate / quaddecim * 1e6
         sampling_frequency = sampling_frequency.item()
 
-        if self.is_baseband_mode:
+        if self.get_is_baseband_mode(buffer_index):
             # Two sequential samples are interpreted as a single complex sample
             # Therefore, we need to halve the sampling frequency
             sampling_frequency = sampling_frequency / 2
 
         return sampling_frequency
+
+    @property
+    def sampling_frequency(self):
+        """The sampling frequency in Hz from the file (all buffers)."""
+        return self.get_sampling_frequency()
 
     def read_tx_waveform_indices(self, tx_order):
         tx_waveform_indices = []
@@ -537,20 +638,55 @@ class VerasonicsFile(h5py.File):
         """Read the azimuth angles of shape (n_tx,) from the file."""
         return self.read_beamsteering_angles(tx_order)[:, 1]
 
+    def get_end_samples(self, buffer_index=None):
+        """The index of the last sample for each receive event.
+
+        Args:
+            buffer_index (int, optional): If given, only return the end samples
+                for receive events belonging to this (0-based) RF buffer. If
+                ``None`` (default), return the values for all receive events.
+        """
+        end_samples = np.concatenate(self.dereference_all(self["Receive"]["endSample"])).squeeze()
+        if buffer_index is not None:
+            end_samples = end_samples[self.receive_indices_for_buffer(buffer_index)]
+        return end_samples
+
+    def get_start_samples(self, buffer_index=None):
+        """The index of the first sample for each receive event.
+
+        Args:
+            buffer_index (int, optional): If given, only return the start samples
+                for receive events belonging to this (0-based) RF buffer. If
+                ``None`` (default), return the values for all receive events.
+        """
+        start_samples = np.concatenate(
+            self.dereference_all(self["Receive"]["startSample"])
+        ).squeeze()
+        if buffer_index is not None:
+            start_samples = start_samples[self.receive_indices_for_buffer(buffer_index)]
+        return start_samples
+
     @property
     def end_samples(self):
-        """The index of the last sample for each receive event."""
-        return np.concatenate(self.dereference_all(self["Receive"]["endSample"])).squeeze()
+        """The index of the last sample for each receive event (all buffers)."""
+        return self.get_end_samples()
 
     @property
     def start_samples(self):
-        """The index of the first sample for each receive event."""
-        return np.concatenate(self.dereference_all(self["Receive"]["startSample"])).squeeze()
+        """The index of the first sample for each receive event (all buffers)."""
+        return self.get_start_samples()
 
-    @property
-    def n_ax(self):
-        """Number of axial samples."""
-        n_ax = (self.end_samples - self.start_samples + 1).astype(np.int32)
+    def get_n_ax(self, buffer_index=None):
+        """Number of axial samples for the given RF buffer.
+
+        Args:
+            buffer_index (int, optional): The 0-based RF buffer to compute the
+                number of axial samples for. If ``None`` (default), all receive
+                events are considered.
+        """
+        n_ax = (
+            self.get_end_samples(buffer_index) - self.get_start_samples(buffer_index) + 1
+        ).astype(np.int32)
         n_ax = np.unique(n_ax)
         if n_ax.size != 1:
             raise ValueError(
@@ -558,6 +694,11 @@ class VerasonicsFile(h5py.File):
                 "We do not support this case yet."
             )
         return n_ax.item()
+
+    @property
+    def n_ax(self):
+        """Number of axial samples (all buffers)."""
+        return self.get_n_ax()
 
     @property
     def is_new_save_raw_format(self):
@@ -681,17 +822,20 @@ class VerasonicsFile(h5py.File):
         frame_indices = self.get_frame_indices(frames, buffer_index)
         raw_data = raw_data[frame_indices]
 
-        # Trim the raw data to the final sample in the buffer
-        final_sample_in_buffer = int(self.end_samples.max())
+        # Trim the raw data to the final sample in the buffer. Use only the
+        # receive events belonging to the selected buffer so that files with
+        # multiple RF buffers are handled correctly.
+        n_ax = self.get_n_ax(buffer_index)
+        final_sample_in_buffer = int(self.get_end_samples(buffer_index).max())
         raw_data = raw_data[:, :, :final_sample_in_buffer]
 
         # Determine n_tx based on the final sample in buffer and n_ax
         # For some sequences, transmits are already aggregated in the raw data
         # (e.g. harmonic imaging through pulse inversion)
-        n_tx = final_sample_in_buffer // self.n_ax
+        n_tx = final_sample_in_buffer // n_ax
 
         # Reshape the raw data to (n_frames, n_el, n_tx, n_ax)
-        raw_data = raw_data.reshape((raw_data.shape[0], raw_data.shape[1], n_tx, self.n_ax))
+        raw_data = raw_data.reshape((raw_data.shape[0], raw_data.shape[1], n_tx, n_ax))
 
         # Transpose the raw data to (n_frames, n_tx, n_ax, n_el)
         raw_data = np.transpose(raw_data, (0, 2, 3, 1))
@@ -699,7 +843,7 @@ class VerasonicsFile(h5py.File):
         # Add channel dimension
         raw_data = raw_data[..., None]
 
-        if self.is_baseband_mode:
+        if self.get_is_baseband_mode(buffer_index):
             raw_data = bs100bw_to_iq(raw_data)
 
         return raw_data
@@ -731,11 +875,18 @@ class VerasonicsFile(h5py.File):
 
         return np.stack(center_frequencies)
 
-    @property
-    def demodulation_frequency(self):
-        """Demodulation frequency of the probe from the file in Hz."""
+    def get_demodulation_frequency(self, buffer_index=None):
+        """Demodulation frequency of the probe from the file in Hz.
 
-        demod_freq = self.dereference_all(self["Receive"]["demodFrequency"])
+        Args:
+            buffer_index (int, optional): If given, only consider receive events
+                belonging to this (0-based) RF buffer. If ``None`` (default), all
+                receive events are considered.
+        """
+        demod_freq = np.asarray(self.dereference_all(self["Receive"]["demodFrequency"])).squeeze()
+        demod_freq = np.atleast_1d(demod_freq)
+        if buffer_index is not None:
+            demod_freq = demod_freq[self.receive_indices_for_buffer(buffer_index)]
         demod_freq = np.unique(demod_freq)
         assert demod_freq.size == 1, (
             f"Multiple demodulation frequencies found in file: {demod_freq}. "
@@ -743,6 +894,11 @@ class VerasonicsFile(h5py.File):
         )
 
         return demod_freq.item() * 1e6
+
+    @property
+    def demodulation_frequency(self):
+        """Demodulation frequency of the probe from the file in Hz (all buffers)."""
+        return self.get_demodulation_frequency()
 
     @property
     def sound_speed(self):
@@ -845,14 +1001,22 @@ class VerasonicsFile(h5py.File):
 
         return focus_distances
 
-    @property
-    def sample_mode(self):
-        """Receive bandwidth as a percentage of center frequency."""
+    def get_sample_mode(self, buffer_index=None):
+        """Receive bandwidth as a percentage of center frequency.
+
+        Args:
+            buffer_index (int, optional): If given, only consider receive events
+                belonging to this (0-based) RF buffer. If ``None`` (default), all
+                receive events are considered.
+        """
         SUPPORTED_SAMPLE_MODES = ["NS200BW", "BS100BW", "BS67BW", "BS50BW"]
 
-        # For all unique sample modes
-        sample_mode = self.dereference_all(self["Receive"]["sampleMode"], func=self.decode_string)
-        sample_mode = set(sample_mode)
+        # For all sample modes
+        sample_modes = self.dereference_all(self["Receive"]["sampleMode"], func=self.decode_string)
+        if buffer_index is not None:
+            indices = self.receive_indices_for_buffer(buffer_index)
+            sample_modes = [sample_modes[i] for i in indices]
+        sample_mode = set(sample_modes)
 
         # Ensure only a single sample mode is used
         assert len(sample_mode) == 1, (
@@ -868,19 +1032,39 @@ class VerasonicsFile(h5py.File):
         return int(sample_mode[2:-2])
 
     @property
-    def is_baseband_mode(self):
+    def sample_mode(self):
+        """Receive bandwidth as a percentage of center frequency (all buffers)."""
+        return self.get_sample_mode()
+
+    def get_is_baseband_mode(self, buffer_index=None):
         """If the data is captured in 'BS100BW' mode or 'BS50BW' mode.
 
         - The data is stored as complex IQ data.
         - The sampling frequency is halved.
         - Two sequential samples are interpreted as a single complex sample.
           Therefore, we need to halve the sampling frequency.
+
+        Args:
+            buffer_index (int, optional): If given, only consider receive events
+                belonging to this (0-based) RF buffer. If ``None`` (default), all
+                receive events are considered.
         """
-        return self.sample_mode in (50, 100)
+        return self.get_sample_mode(buffer_index) in (50, 100)
 
     @property
-    def tgc_gain_curve(self):
-        """The TGC gain curve from the file interpolated to the number of axial samples (n_ax,)."""
+    def is_baseband_mode(self):
+        """If the data is captured in 'BS100BW' or 'BS50BW' mode (all buffers)."""
+        return self.get_is_baseband_mode()
+
+    def get_tgc_gain_curve(self, buffer_index=None):
+        """The TGC gain curve interpolated to the number of axial samples (n_ax,).
+
+        Args:
+            buffer_index (int, optional): If given, compute the number of axial
+                samples and sampling frequency for this (0-based) RF buffer, so
+                that files with multiple buffers use the correct buffer. If
+                ``None`` (default), all receive events are considered.
+        """
 
         gain_curve = self["TGC"]["Waveform"][:][:, 0]
 
@@ -895,10 +1079,11 @@ class VerasonicsFile(h5py.File):
         t_gain_curve = np.arange(gain_curve.size) * gain_curve_sampling_period
 
         # For baseband mode two consecutive samples are combined into a single complex sample
-        n_ax = self.n_ax if not self.is_baseband_mode else self.n_ax // 2
+        base_n_ax = self.get_n_ax(buffer_index)
+        n_ax = base_n_ax if not self.get_is_baseband_mode(buffer_index) else base_n_ax // 2
 
         # Define the time axis for the axial samples
-        t_samples = np.arange(n_ax) / self.sampling_frequency
+        t_samples = np.arange(n_ax) / self.get_sampling_frequency(buffer_index)
 
         # Interpolate the gain_curve to the number of axial samples
         gain_curve = np.interp(t_samples, t_gain_curve, gain_curve)
@@ -908,23 +1093,33 @@ class VerasonicsFile(h5py.File):
 
         return gain_curve
 
-    def get_image_data_p_frame_order(self, buffer_index=0):
+    @property
+    def tgc_gain_curve(self):
+        """The TGC gain curve interpolated to the number of axial samples (all buffers)."""
+        return self.get_tgc_gain_curve()
+
+    def get_image_data_p_frame_order(self, image_buffer_index=0):
         """The order of frames in the ImgDataP buffer.
 
         Because of the circular buffer used in Verasonics, the frames in the ImgDataP
         buffer are not necessarily in the correct order. This function computes the
         correct order of frames.
+
+        Args:
+            image_buffer_index (int, optional): The 0-based image buffer
+                (``Resource.ImageBuffer``) to compute the frame order for.
+                Defaults to 0.
         """
         n_frames = self.dereference_index(
-            self["Resource"]["ImageBuffer"]["numFrames"], buffer_index
+            self["Resource"]["ImageBuffer"]["numFrames"], image_buffer_index
         )
         n_frames = self.cast_to_integer(n_frames)
         try:
             first_frame = self.dereference_index(
-                self["Resource"]["ImageBuffer"]["firstFrame"], buffer_index
+                self["Resource"]["ImageBuffer"]["firstFrame"], image_buffer_index
             )
             last_frame = self.dereference_index(
-                self["Resource"]["ImageBuffer"]["lastFrame"], buffer_index
+                self["Resource"]["ImageBuffer"]["lastFrame"], image_buffer_index
             )
             first_frame = self.cast_to_integer(first_frame) - 1  # make 0-based
             last_frame = self.cast_to_integer(last_frame) - 1  # make 0-based
@@ -940,7 +1135,7 @@ class VerasonicsFile(h5py.File):
             )
             return np.arange(n_frames)
 
-    def read_image_data_p(self, frames="all", buffer_index=0):
+    def read_image_data_p(self, frames="all", image_buffer_index=0):
         """Reads the image data from the file.
 
         Uses the ``ImgDataP`` buffer, which is used for spatial filtering
@@ -949,6 +1144,17 @@ class VerasonicsFile(h5py.File):
         every acquired frame. This means that the images in this buffer often skip frames, and
         span a longer time period than the raw data buffer.
 
+        Note:
+            The image buffer (``ImgDataP`` / ``Resource.ImageBuffer``) is indexed
+            independently from the RF buffer (``RcvData`` / ``Resource.RcvBuffer``).
+            ``image_buffer_index`` therefore selects the image buffer directly and
+            is **not** assumed to correspond to any RF ``buffer_index``.
+
+        Args:
+            frames (str or list, optional): The frames to read. Defaults to "all".
+            image_buffer_index (int, optional): The 0-based image buffer
+                (``Resource.ImageBuffer``) to read from. Defaults to 0.
+
         Returns:
             `image_data` (`np.ndarray`): The image data.
         """
@@ -956,13 +1162,27 @@ class VerasonicsFile(h5py.File):
         if "ImgDataP" not in self:
             return None
 
+        # The ImgDataP image buffer is indexed independently from the RF
+        # RcvBuffer. Validate the requested image buffer explicitly instead of
+        # silently falling back, so an out-of-range selection is a clear error.
+        image_refs = np.atleast_1d(self["ImgDataP"][:].squeeze())
+        n_image_buffers = image_refs.shape[0]
+        if image_buffer_index < 0 or image_buffer_index >= n_image_buffers:
+            raise ValueError(
+                f"image_buffer_index={image_buffer_index} is out of range; the file "
+                f"contains {n_image_buffers} image buffer(s) (valid indices "
+                f"0..{n_image_buffers - 1})."
+            )
+
         # Get the dataset reference
-        image_data_ref = self["ImgDataP"][:].squeeze()[buffer_index]
+        image_data_ref = image_refs[image_buffer_index]
         # Dereference the dataset
         image_data = self[image_data_ref][:]
 
-        # Re-order images such that sequence is correct
-        indices = self.get_image_data_p_frame_order(buffer_index)
+        # Re-order images such that sequence is correct. Frame order and frame
+        # count both come from the image buffer (Resource.ImageBuffer), not the
+        # RF buffer.
+        indices = self.get_image_data_p_frame_order(image_buffer_index)
         image_data = image_data[indices, :, :]
 
         # Normalize and log-compress the image data
@@ -970,8 +1190,11 @@ class VerasonicsFile(h5py.File):
         image_data = log_compress(image_data)
         image_data = ops.convert_to_numpy(image_data)
 
-        # Select only the requested frames
-        frame_indices = self.get_frame_indices(frames, buffer_index)
+        # Select only the requested frames. The number of available frames is
+        # taken from the image buffer, since it generally differs from the RF
+        # buffer (the Verasonics often does not reconstruct every acquired frame).
+        n_image_frames = image_data.shape[0]
+        frame_indices = self.get_frame_indices(frames, n_frames=n_image_frames)
         image_data = image_data[frame_indices]
 
         return image_data
@@ -1022,18 +1245,18 @@ class VerasonicsFile(h5py.File):
             "time_to_next_transmit": time_to_next_transmit,
             "t0_delays": t0_delays,
             "tx_apodizations": tx_apodizations,
-            "sampling_frequency": self.sampling_frequency,
+            "sampling_frequency": self.get_sampling_frequency(buffer_index),
             "polar_angles": polar_angles,
             "azimuth_angles": azimuth_angles,
             "center_frequency": center_frequency,
-            "demodulation_frequency": self.demodulation_frequency,
+            "demodulation_frequency": self.get_demodulation_frequency(buffer_index),
             "sound_speed": self.sound_speed,
             "initial_times": initial_times,
             "focus_distances": focus_distances,
             "transmit_origins": transmit_origins,
             "waveforms_one_way": waveforms_one_way,
             "waveforms_two_way": waveforms_two_way,
-            "tgc_gain_curve": self.tgc_gain_curve,
+            "tgc_gain_curve": self.get_tgc_gain_curve(buffer_index),
         }
 
     def read_verasonics_file(
@@ -1043,6 +1266,7 @@ class VerasonicsFile(h5py.File):
         buffer_index=0,
         additional_functions=None,
         lens_sound_speed: float = 1000.0,
+        image_buffer_index: int = 0,
     ):
         """Reads data from a .mat Verasonics output file.
 
@@ -1054,7 +1278,9 @@ class VerasonicsFile(h5py.File):
                 on the Verasonics system (e.g. harmonic imaging through pulse inversion).
                 In this case, the mode in the Receive structure is set to 1 (accumulate).
                 If this flag is set to False, an error is raised when such a mode is detected.
-            buffer_index (int, optional): The buffer index to read from. Defaults to 0.
+            buffer_index (int, optional): The 0-based RF buffer (``RcvData`` /
+                ``Resource.RcvBuffer``) to read the raw data and scan parameters
+                from. Defaults to 0.
             additional_functions (list, optional): A list of functions that read additional
                 data from the file. Each function should take the `VerasonicsFile` as input
                 and return a `CustomElement`. Defaults to None.
@@ -1063,6 +1289,10 @@ class VerasonicsFile(h5py.File):
                 wavelengths) into ``lens_thickness`` and ``lens_sound_speed`` fields on the
                 probe dict.  Only applied when the file contains a ``lensCorrection`` field.
                 Defaults to 1000.0.
+            image_buffer_index (int, optional): The 0-based image buffer
+                (``ImgDataP`` / ``Resource.ImageBuffer``) to store as the
+                ``verasonics_image_buffer`` reference element. This is indexed
+                independently from ``buffer_index``. Defaults to 0.
         """
 
         if additional_functions is None:
@@ -1109,7 +1339,9 @@ class VerasonicsFile(h5py.File):
 
         # Add Verasonics ImgDataP buffer to additional elements
         try:
-            verasonics_image_buffer = self.read_image_data_p(frames=frames)
+            verasonics_image_buffer = self.read_image_data_p(
+                frames=frames, image_buffer_index=image_buffer_index
+            )
             verasonics_image_buffer = CustomElement(
                 name="verasonics_image_buffer",
                 data=verasonics_image_buffer,
@@ -1162,18 +1394,27 @@ class VerasonicsFile(h5py.File):
         else:
             raise value_error
 
-    def get_frame_indices(self, frames, buffer_index=0):
+    def get_frame_indices(self, frames, buffer_index=0, n_frames=None):
         """Creates a numpy array of frame indices from the file and the frames argument.
 
         Args:
             frames (str): The frames argument. This can be "all", a range of integers
                 (e.g. "4-8"), or a list of frame indices.
+            buffer_index (int, optional): The 0-based RF buffer whose frame count
+                is used to resolve/validate the requested frames. Ignored when
+                ``n_frames`` is given. Defaults to 0.
+            n_frames (int, optional): Explicit number of available frames. When
+                provided it overrides the RF-buffer frame count, which is needed
+                for buffers indexed independently from the RF buffer (e.g. the
+                ``ImgDataP`` image buffer). Defaults to None.
 
         Returns:
             frame_indices (np.ndarray): The frame indices.
         """
-        # Read the number of frames from the file
-        n_frames = self.get_frame_count(buffer_index)
+        # Number of available frames: use the explicit count when given
+        # (e.g. for the image buffer), otherwise read it from the RF buffer.
+        if n_frames is None:
+            n_frames = self.get_frame_count(buffer_index)
 
         frame_indices = self._parse_frames_argument(frames, n_frames)
         frame_indices = np.asarray(frame_indices)
@@ -1199,6 +1440,8 @@ class VerasonicsFile(h5py.File):
         enable_compression=True,
         additional_functions=None,
         lens_sound_speed: float = 1000.0,
+        buffer_index: int = 0,
+        image_buffer_index: int = 0,
     ):
         """Converts the Verasonics file to the zea format.
 
@@ -1222,14 +1465,28 @@ class VerasonicsFile(h5py.File):
                 Used to convert ``Trans.lensCorrection`` (wavelengths) into
                 ``lens_thickness`` and ``lens_sound_speed`` fields on the probe. Defaults
                 to 1000.0.
+            buffer_index (int, optional): The 0-based RF buffer to convert. Files that
+                define multiple RF buffers (e.g. ``RcvData{1}`` and ``RcvData{2}``) store
+                one buffer per index; only the transmit, receive, and seq_control entries
+                belonging to this buffer are used. Defaults to 0 (the first buffer).
+            image_buffer_index (int, optional): The 0-based Verasonics image buffer
+                (``ImgDataP`` / ``Resource.ImageBuffer``) to store as the
+                ``verasonics_image_buffer`` reference element. The image buffer is
+                indexed independently from the RF ``buffer_index``, so e.g. RF
+                buffer 2 can be paired with image buffer 4. Defaults to 0.
         """
         # Here we call all the functions to read the data from the file
-        log.info("Reading Verasonics file...")
+        log.info(
+            f"Reading Verasonics file (RF buffer index {buffer_index}, "
+            f"image buffer index {image_buffer_index})..."
+        )
         data_dict, scan_dict, probe_dict, custom_elements = self.read_verasonics_file(
             frames=frames,
             allow_accumulate=allow_accumulate,
+            buffer_index=buffer_index,
             additional_functions=additional_functions,
             lens_sound_speed=lens_sound_speed,
+            image_buffer_index=image_buffer_index,
         )
 
         # Generate the zea dataset
