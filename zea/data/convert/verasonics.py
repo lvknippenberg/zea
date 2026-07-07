@@ -247,14 +247,47 @@ class VerasonicsFile(h5py.File):
         This function dereferences the dataset if it is a reference. Otherwise, it returns
         the dataset.
 
+        The reference dataset may be stored as a column vector ``(N, 1)`` (as for
+        most struct-array fields, e.g. ``Receive.bufnum``) or as a row vector
+        ``(1, N)`` (as MATLAB stores multi-element cell arrays such as
+        ``RcvData`` when there is more than one RF buffer). To handle both, the
+        reference array is flattened before selecting ``index`` so the
+        buffer/element axis is picked regardless of orientation.
+
+        A single-element MATLAB cell (e.g. ``RcvData`` in a single-RF-buffer
+        acquisition) is often stored *not* as a reference array but as the plain
+        numeric matrix itself. In that case the dataset represents exactly one
+        element, so only ``index == 0`` is valid and the matrix is returned
+        as-is. This keeps single-buffer and multi-buffer files behaving
+        consistently (a nonexistent buffer raises instead of silently returning
+        buffer 0).
+
         Args:
             dataset (h5py.Dataset): The dataset to read the element from.
             index (int): The index of the element to read.
         """
         if isinstance(dataset.fillvalue, h5py.h5r.Reference):
-            reference = dataset[index].item()
-            return self[reference][:]
+            # Flatten so a single logical index works for both (N, 1) column
+            # vectors and (1, N) row vectors (e.g. RcvData). Indexing the raw
+            # dataset directly would return a whole row for a (1, N) array and
+            # then fail in ``.item()`` ("can only convert an array of size 1").
+            references = np.asarray(dataset[:]).reshape(-1)
+            if index < 0 or index >= references.size:
+                raise IndexError(
+                    f"index {index} is out of range for a reference dataset with "
+                    f"{references.size} element(s)."
+                )
+            return self[references[index]][:]
         else:
+            # Non-reference dataset: a single stored element (e.g. a scalar
+            # struct field, or a single-cell RcvData stored as a plain matrix).
+            # Only index 0 is valid here.
+            if index != 0:
+                raise IndexError(
+                    f"index {index} is out of range: this dataset is stored as a "
+                    "single (non-reference) element, so only index 0 is valid. "
+                    "For RcvData this means the file contains a single RF buffer."
+                )
             return dataset
 
     def dereference_all(self, dataset, func=None):
@@ -277,9 +310,17 @@ class VerasonicsFile(h5py.File):
 
     @staticmethod
     def get_reference_size(dataset):
-        """Get the size of a reference dataset."""
+        """Get the number of references in a reference dataset.
+
+        Uses the total number of elements rather than ``len`` (which is only the
+        first axis). MATLAB stores struct-array fields as column vectors
+        ``(N, 1)`` but cell arrays such as ``RcvData``/``ImgDataP`` as row
+        vectors ``(1, N)``; ``.size`` gives ``N`` for both, matching the flatten
+        used in :meth:`dereference_index`. A non-reference dataset represents a
+        single stored element, so its size is 1.
+        """
         if isinstance(dataset.fillvalue, h5py.h5r.Reference):
-            return len(dataset)
+            return int(np.asarray(dataset[:]).size)
         else:
             return 1
 
@@ -405,10 +446,15 @@ class VerasonicsFile(h5py.File):
             if not bool(event_tx) == bool(event_rcv):
                 log.warning(
                     "Events should have both a transmit and a receive or neither. "
-                    f"Event {i} has a transmit but no receive or vice versa."
+                    f"Event {i} has a transmit but no receive or vice versa. Skipping it."
                 )
 
-            if not event_tx:
+            # Only events that have *both* a transmit and a receive contribute to
+            # the transmit/receive ordering. Skip events without a transmit, and
+            # also events without a receive (e.g. transmit-only push/flash
+            # events): the latter have event_rcv == 0, which would otherwise
+            # become -1 below and index the Receive array out of range.
+            if not event_tx or not event_rcv:
                 continue
 
             # Subtract one to make the indices 0-based
@@ -442,6 +488,11 @@ class VerasonicsFile(h5py.File):
 
             for seq_control_index in seq_control_indices:
                 seq_control_index = int(seq_control_index.item() - 1)
+                # A seqControl entry of 0 (-> -1 after the 0-based shift) means the
+                # event has no seq control at this position; skip it rather than
+                # indexing the SeqControl array out of range.
+                if seq_control_index < 0:
+                    continue
                 seq_control = self.dereference_index(
                     self["SeqControl"]["command"], seq_control_index
                 )
@@ -475,7 +526,14 @@ class VerasonicsFile(h5py.File):
             tx_order = tx_order[modes == 0]
             rcv_order = rcv_order[modes == 0]
 
-            log.info("Dropping time to next acquisition for accumulate mode transmits.")
+            log.info(
+                "Dropping time to next acquisition (time_to_next_transmit will be "
+                "None). In accumulate sequences (e.g. pulse inversion), each stored "
+                "acquisition is formed from several transmits that each carry their "
+                "own timeToNextAcq, so the per-transmit timing no longer maps "
+                "one-to-one onto the stored transmits and cannot be represented "
+                "correctly. It is left unset rather than filled with a misleading value."
+            )
             time_to_next_acq = None
 
         # Reshape the per-transmit times into (n_frames, n_tx). Do this only when
@@ -800,14 +858,50 @@ class VerasonicsFile(h5py.File):
             f"(n_frames, n_channels, n_samples), but got {raw_data.shape}."
         )
 
-        # Reorder and select channels based on probe elements
-        if self.is_new_save_raw_format:
-            raw_data = raw_data[:, self.probe.connector, :]
+        # Reorder and select channels based on probe elements.
+        #
+        # Verasonics acquires on all hardware receive channels (e.g. 128), which
+        # for a probe with fewer elements (e.g. 80) means the raw data has more
+        # channels than the probe has elements. The probe's ``ConnectorES`` map
+        # (exposed as ``self.probe.connector``) selects, for each element, the
+        # hardware channel it was acquired on, reconciling the raw-data channel
+        # count with the element count used by t0_delays / apodization.
+        #
+        # This selection must happen whenever the raw channel count does not
+        # already match the number of probe elements. The older code only did it
+        # for files saved with the updated ``save_raw`` function (>= 1.0), which
+        # left files without that flag with a channel/element mismatch
+        # (e.g. "Dimension 'n_el' has inconsistent sizes: 80 vs 128").
+        n_channels = raw_data.shape[1]
+        connector = self.probe.connector
+        n_elements = self.probe.geometry.shape[0]
+
+        if n_channels == n_elements and not self.is_new_save_raw_format:
+            # Channel count already matches the elements and the data was not
+            # saved with the updated save_raw (which always reorders): assume the
+            # channel order already matches the probe element order.
+            pass
+        elif connector is not None and connector.size == n_elements:
+            # Map the acquired hardware channels down to the probe elements.
+            if connector.min() < 0 or connector.max() >= n_channels:
+                raise ValueError(
+                    "Cannot map acquired channels to probe elements: connector "
+                    f"indices span [{int(connector.min())}, {int(connector.max())}] "
+                    f"but the raw data has only {n_channels} channels."
+                )
+            if n_channels != n_elements:
+                log.info(
+                    f"Raw data has {n_channels} channels but the probe has "
+                    f"{n_elements} elements; selecting element channels via "
+                    "Trans.ConnectorES."
+                )
+            raw_data = raw_data[:, connector, :]
         else:
             log.warning(
-                "Data was not saved using the updated `save_raw` function (version >= 1.0). "
-                "In that case, we assume that the channel order in the data matches the "
-                "probe element order. Please verify that this is correct!"
+                f"Raw data has {n_channels} channels but the probe has "
+                f"{n_elements} elements, and no usable connector map "
+                "(Trans.ConnectorES) was found. Assuming the channel order matches "
+                "the probe element order. Please verify that this is correct!"
             )
 
         # Re-order frames such that sequence is correct
@@ -1162,11 +1256,13 @@ class VerasonicsFile(h5py.File):
         if "ImgDataP" not in self:
             return None
 
-        # The ImgDataP image buffer is indexed independently from the RF
-        # RcvBuffer. Validate the requested image buffer explicitly instead of
-        # silently falling back, so an out-of-range selection is a clear error.
-        image_refs = np.atleast_1d(self["ImgDataP"][:].squeeze())
-        n_image_buffers = image_refs.shape[0]
+        # ImgDataP is a MATLAB cell array. Like RcvData, MATLAB stores it as a
+        # dataset of references (one per image buffer); with a single image
+        # buffer it may be a (1, 1) reference or a plain matrix. Use the same
+        # dereferencing path as the RF buffers so every storage form is handled
+        # uniformly, and validate the requested image buffer explicitly instead
+        # of silently falling back.
+        n_image_buffers = self.get_reference_size(self["ImgDataP"])
         if image_buffer_index < 0 or image_buffer_index >= n_image_buffers:
             raise ValueError(
                 f"image_buffer_index={image_buffer_index} is out of range; the file "
@@ -1174,10 +1270,9 @@ class VerasonicsFile(h5py.File):
                 f"0..{n_image_buffers - 1})."
             )
 
-        # Get the dataset reference
-        image_data_ref = image_refs[image_buffer_index]
-        # Dereference the dataset
-        image_data = self[image_data_ref][:]
+        # Dereference the selected image buffer.
+        image_data = self.dereference_index(self["ImgDataP"], image_buffer_index)
+        image_data = np.asarray(image_data)
 
         # Re-order images such that sequence is correct. Frame order and frame
         # count both come from the image buffer (Resource.ImageBuffer), not the
@@ -1337,22 +1432,30 @@ class VerasonicsFile(h5py.File):
         for additional_function in additional_functions:
             custom_elements.append(additional_function(self))
 
-        # Add Verasonics ImgDataP buffer to additional elements
+        # Add Verasonics ImgDataP buffer to additional elements. This buffer is
+        # optional: files that were not reconstructed on the Verasonics system
+        # (or reduced/exported workspaces) may not contain ImgDataP at all, in
+        # which case read_image_data_p returns None and we simply skip it rather
+        # than store an empty (None) custom element.
         try:
             verasonics_image_buffer = self.read_image_data_p(
                 frames=frames, image_buffer_index=image_buffer_index
             )
-            verasonics_image_buffer = CustomElement(
-                name="verasonics_image_buffer",
-                data=verasonics_image_buffer,
-                description=(
-                    "The Verasonics ImgDataP buffer. "
-                    "WARNING: This buffer may skip frames compared to the raw data! "
-                    "Use only for reference."
-                ),
-                unit="unitless",
-            )
-            custom_elements.append(verasonics_image_buffer)
+            if verasonics_image_buffer is None:
+                log.info("No ImgDataP image buffer found in file; skipping.")
+            else:
+                custom_elements.append(
+                    CustomElement(
+                        name="verasonics_image_buffer",
+                        data=verasonics_image_buffer,
+                        description=(
+                            "The Verasonics ImgDataP buffer. "
+                            "WARNING: This buffer may skip frames compared to the raw data! "
+                            "Use only for reference."
+                        ),
+                        unit="unitless",
+                    )
+                )
         except Exception as e:
             log.error(f"Could not read Verasonics ImgDataP buffer: {e}, skipping.")
 
@@ -1583,17 +1686,33 @@ class VerasonicsProbe:
 
     @property
     def type(self):
-        """The type of the probe from the file."""
-        if "type" in self.trans_obj.keys():
-            _id_to_str = {
-                0: "linear",
-                1: "curved",
-                2: "2D-array",
-                3: "annular",
-                4: "row-column",
-            }
-            probe_type_id = int(self.trans_obj["type"][:].item())
-            return _id_to_str.get(probe_type_id)
+        """The type of the probe from the file.
+
+        Always returns a string. Falls back to ``"unknown"`` (with a warning) when
+        the ``Trans.type`` field is missing or holds an unrecognized id, because
+        this value is written to a string field in the zea format and ``None``
+        cannot be stored there.
+        """
+        _id_to_str = {
+            0: "linear",
+            1: "curved",
+            2: "2D-array",
+            3: "annular",
+            4: "row-column",
+        }
+        if "type" not in self.trans_obj.keys():
+            log.warning("Trans.type not found in file; falling back to probe type 'unknown'.")
+            return "unknown"
+
+        probe_type_id = int(self.trans_obj["type"][:].item())
+        probe_type = _id_to_str.get(probe_type_id)
+        if probe_type is None:
+            log.warning(
+                f"Unrecognized Trans.type id {probe_type_id}; expected one of "
+                f"{sorted(_id_to_str)}. Falling back to probe type 'unknown'."
+            )
+            return "unknown"
+        return probe_type
 
     @property
     def element_width(self):
@@ -1616,7 +1735,14 @@ class VerasonicsProbe:
 
     @property
     def connector(self):
-        """Probe connector indices."""
+        """Probe connector indices (0-based) mapping elements to hardware channels.
+
+        Returns ``None`` if the transducer has no ``ConnectorES`` field, in which
+        case the caller assumes the raw-data channel order already matches the
+        probe element order.
+        """
+        if "ConnectorES" not in self.trans_obj.keys():
+            return None
         connector = self.trans_obj["ConnectorES"][:]
         connector = np.squeeze(connector, axis=0)
         connector = connector.astype(np.int32)
