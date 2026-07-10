@@ -53,7 +53,9 @@ The data is stored in the ``data`` group and the scan parameters are stored in t
 import os
 import re
 import sys
+import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 import h5py
@@ -80,6 +82,35 @@ _VERASONICS_TO_ZEA_PROBE_NAMES = {
 
 
 _FRAMES_RANGE_RE = re.compile(r"^\d+(-\d+)?$")
+
+
+# Lightweight profiling. Enable by setting the environment variable
+# ZEA_VERASONICS_PROFILE=1 (or true/yes). When enabled, the converter logs how
+# long each major stage takes, which helps locate bottlenecks (e.g. reading a
+# very large Receive/Event structure).
+_PROFILE_ENABLED = strtobool(os.environ.get("ZEA_VERASONICS_PROFILE", "0"))
+
+
+@contextmanager
+def _profile(label, store=None):
+    """Context manager that logs the wall-clock time of a labelled block.
+
+    Args:
+        label (str): Name of the stage being timed.
+        store (dict, optional): If given, the elapsed time is also recorded under
+            ``store[label]`` so callers can build a summary.
+    """
+    if not _PROFILE_ENABLED:
+        yield
+        return
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        if store is not None:
+            store[label] = store.get(label, 0.0) + elapsed
+        log.info(f"[profile] {label}: {elapsed:.3f} s")
 
 
 def estimate_lens_probe_params(
@@ -835,16 +866,190 @@ class VerasonicsFile(h5py.File):
 
         return self.get_indices_to_reorder(first_frame, n_frames)
 
+    # ------------------------------------------------------------------
+    # RF buffer source (RcvData in the .mat, or external binary files)
+    # ------------------------------------------------------------------
+    # Verasonics saves RF as a MATLAB cell array ``RcvData{k}``. Writing the
+    # full workspace to a v7.3 ``.mat`` is slow for large RF buffers, so an
+    # alternative workflow saves the RF of each buffer to a raw binary file
+    # ``RF_data_{k}.bin`` (int16, MATLAB column-major) next to a v7.3 ``.mat``
+    # that holds all the metadata plus:
+    #   - ``RF_rows``   (1, N): fast-time samples per buffer (full sample count)
+    #   - ``RF_cols``   (1, N): number of *saved* channels per buffer
+    #   - ``RF_frames`` (1, N): number of frames per buffer
+    #   - ``NonzeroRFcolumns`` {N}: per-buffer logical mask (length = full number
+    #     of hardware channels) that is True for every saved channel. This
+    #     defines both which columns of the binary map to which hardware
+    #     channels and the full hardware-channel count (which need not be 128).
+    # Only *saved* buffers have a ``RF_data_{k}.bin`` file; a buffer may hold
+    # data on the system yet not be saved for a given measurement.
+
+    RF_BINARY_TEMPLATE = "RF_data_{k}.bin"
+
+    @property
+    def has_rcvdata(self):
+        """Whether the ``.mat`` file contains an in-file ``RcvData`` cell array."""
+        return "RcvData" in self
+
+    @property
+    def _mat_dir(self):
+        """Directory containing the ``.mat`` file (used to locate ``.bin`` files)."""
+        return Path(self.filename).resolve().parent
+
+    def rf_binary_path(self, buffer_index):
+        """Path to the external ``RF_data_{k}.bin`` for a 0-based ``buffer_index``.
+
+        Verasonics/MATLAB buffers are 1-based, so ``buffer_index=i`` maps to the
+        file for ``RcvData{i + 1}``.
+        """
+        return self._mat_dir / self.RF_BINARY_TEMPLATE.format(k=buffer_index + 1)
+
+    def available_binary_buffers(self):
+        """0-based indices of buffers that have an external ``RF_data_{k}.bin``."""
+        available = []
+        # The number of buffers is known from the RF_* dimension arrays when
+        # present, otherwise scan a reasonable range of filenames.
+        n = None
+        if "RF_frames" in self:
+            n = int(np.asarray(self["RF_frames"][:]).size)
+        indices = range(n) if n is not None else range(64)
+        for i in indices:
+            if self.rf_binary_path(i).is_file():
+                available.append(i)
+        return available
+
+    def _read_rf_dimension(self, name, buffer_index):
+        """Read entry ``buffer_index`` from a ``(1, N)`` RF dimension array."""
+        if name not in self:
+            raise KeyError(
+                f"'{name}' not found in the .mat file. It is required to read RF "
+                "data from an external binary file (it stores the per-buffer "
+                "dimensions)."
+            )
+        values = np.asarray(self[name][:]).reshape(-1)
+        if buffer_index >= values.size:
+            raise IndexError(
+                f"buffer_index={buffer_index} is out of range for '{name}' with "
+                f"{values.size} entries."
+            )
+        return int(values[buffer_index])
+
+    def read_nonzero_rf_columns(self, buffer_index):
+        """Boolean mask of saved hardware channels for ``buffer_index``.
+
+        Reads ``NonzeroRFcolumns{buffer_index + 1}`` (a MATLAB logical vector).
+        The length of the mask is the full number of hardware channels for the
+        buffer, and it is ``True`` for every channel that was written to the
+        binary file. Returns ``None`` if the file has no ``NonzeroRFcolumns``.
+        """
+        if "NonzeroRFcolumns" not in self:
+            return None
+        mask = self.dereference_index(self["NonzeroRFcolumns"], buffer_index)
+        mask = np.asarray(mask).reshape(-1).astype(bool)
+        return mask
+
+    def read_raw_buffer_array(self, buffer_index):
+        """Return the raw ``(n_frames, n_channels, n_samples)`` array for a buffer.
+
+        Reads from ``RcvData`` when present in the ``.mat`` file, otherwise from
+        the external ``RF_data_{k}.bin`` binary. In both cases the returned array
+        has the full hardware-channel dimension (zero-filled for channels that
+        were not saved), so the downstream ``ConnectorES`` element selection in
+        :meth:`read_raw_data` behaves identically for both sources.
+        """
+        if self.has_rcvdata:
+            raw_data = self.dereference_index(self["RcvData"], buffer_index)
+            return np.asarray(raw_data, dtype=np.int16)
+
+        return self._read_raw_buffer_from_binary(buffer_index)
+
+    def _read_raw_buffer_from_binary(self, buffer_index):
+        """Read and reconstruct a raw buffer from an external ``RF_data_{k}.bin``.
+
+        The binary stores only the saved (nonzero) channels, written by MATLAB
+        ``fwrite`` in column-major order with shape ``(RF_rows, RF_cols,
+        RF_frames)``. This method reads it, restores the MATLAB dimension order,
+        scatters the saved channels back into a full hardware-channel array using
+        the ``NonzeroRFcolumns`` mask, and returns
+        ``(n_frames, n_hardware_channels, n_samples)`` to match ``RcvData``.
+        """
+        binary_path = self.rf_binary_path(buffer_index)
+        if not binary_path.is_file():
+            available = self.available_binary_buffers()
+            available_1based = [i + 1 for i in available]
+            raise FileNotFoundError(
+                f"No RF data found for buffer_index={buffer_index}: the .mat file "
+                f"has no 'RcvData' and no binary file '{binary_path.name}' exists "
+                f"in {self._mat_dir}. Saved buffers (MATLAB 1-based) are "
+                f"{available_1based}. Note that a buffer may hold data on the "
+                "system yet not be saved for a given measurement."
+            )
+
+        # Per-buffer dimensions (MATLAB layout: rows=fast time, cols=saved
+        # channels, frames).
+        rows = self._read_rf_dimension("RF_rows", buffer_index)
+        cols = self._read_rf_dimension("RF_cols", buffer_index)
+        n_frames = self._read_rf_dimension("RF_frames", buffer_index)
+
+        # Read the raw int16 stream (little-endian, as written on PCWIN64).
+        raw = np.fromfile(binary_path, dtype="<i2")
+        expected = rows * cols * n_frames
+        if raw.size != expected:
+            raise ValueError(
+                f"Binary file '{binary_path.name}' has {raw.size} int16 values but "
+                f"RF_rows*RF_cols*RF_frames = {rows}*{cols}*{n_frames} = {expected}. "
+                "The binary file and the stored dimensions are inconsistent."
+            )
+
+        # MATLAB fwrite is column-major: reshape as (rows, cols, frames) in
+        # Fortran order, then move to (frames, cols, rows) to match how RcvData
+        # is delivered (n_frames, n_channels, n_samples).
+        raw = raw.reshape((rows, cols, n_frames), order="F")
+        raw = np.transpose(raw, (2, 1, 0))  # (n_frames, cols, rows)
+
+        # Scatter the saved channels back into the full hardware-channel array
+        # using the NonzeroRFcolumns mask.
+        mask = self.read_nonzero_rf_columns(buffer_index)
+        if mask is None:
+            # Without a mask we cannot know the full channel count or where the
+            # saved channels belong; fall back to treating the saved channels as
+            # the full set (only valid if nothing was zero-padded away).
+            log.warning(
+                "'NonzeroRFcolumns' not found; assuming the binary file contains "
+                "all hardware channels in order. If the acquisition zero-padded "
+                "channels, provide NonzeroRFcolumns for correct reconstruction."
+            )
+            return np.ascontiguousarray(raw, dtype=np.int16)
+
+        if int(mask.sum()) != cols:
+            raise ValueError(
+                f"NonzeroRFcolumns for buffer {buffer_index + 1} marks "
+                f"{int(mask.sum())} saved channels, but RF_cols={cols} "
+                f"(binary column count). These must match."
+            )
+
+        n_hardware_channels = mask.size
+        full = np.zeros((n_frames, n_hardware_channels, rows), dtype=np.int16)
+        full[:, mask, :] = raw
+        return full
+
     def read_raw_data(self, frames="all", buffer_index=0, first_frame_idx=None):
         """
         Read the raw data from the file.
+
+        The channel data is read either from the ``RcvData`` cell array inside the
+        ``.mat`` file, or - when ``RcvData`` is absent - from an external binary
+        file ``RF_data_{k}.bin`` (see :meth:`read_raw_buffer_array`). Everything
+        after the initial read (channel selection, frame ordering, trimming and
+        reshaping) is identical for both sources.
 
         Returns:
             raw_data (np.ndarray): The raw data of shape (n_rcv, n_samples).
         """
 
-        # Read the raw data from the file
-        raw_data = self.dereference_index(self["RcvData"], buffer_index)
+        # Read the raw (n_frames, n_channels, n_samples) array for this buffer,
+        # from RcvData or from an external binary file.
+        raw_data = self.read_raw_buffer_array(buffer_index)
 
         # Convert the raw data to a numpy array to allow out-of-order indexing later
         raw_data = np.asarray(raw_data, dtype=np.int16)
@@ -1313,19 +1518,28 @@ class VerasonicsFile(h5py.File):
         if frames is None:
             frames = convert_config.get("frames", "all")
 
-        tx_order, rcv_order, time_to_next_transmit = self.read_transmit_events(
-            frames=frames, allow_accumulate=allow_accumulate, buffer_index=buffer_index
-        )
-        initial_times = self.read_initial_times(rcv_order)
+        with _profile("  read_transmit_events (event loop over all events)"):
+            tx_order, rcv_order, time_to_next_transmit = self.read_transmit_events(
+                frames=frames, allow_accumulate=allow_accumulate, buffer_index=buffer_index
+            )
+        with _profile("  read_initial_times"):
+            initial_times = self.read_initial_times(rcv_order)
 
-        polar_angles = self.read_polar_angles(tx_order)
-        azimuth_angles = self.read_azimuth_angles(tx_order)
-        t0_delays, tx_apodizations = self.read_t0_delays_apod(tx_order)
-        focus_distances = self.read_focus_distances(tx_order)
-        transmit_origins = self.read_transmit_origins(tx_order)
+        with _profile("  read_polar_angles"):
+            polar_angles = self.read_polar_angles(tx_order)
+        with _profile("  read_azimuth_angles"):
+            azimuth_angles = self.read_azimuth_angles(tx_order)
+        with _profile("  read_t0_delays_apod"):
+            t0_delays, tx_apodizations = self.read_t0_delays_apod(tx_order)
+        with _profile("  read_focus_distances"):
+            focus_distances = self.read_focus_distances(tx_order)
+        with _profile("  read_transmit_origins"):
+            transmit_origins = self.read_transmit_origins(tx_order)
 
-        waveforms_one_way_list, waveforms_two_way_list = self.read_waveforms()
-        tx_waveform_indices = self.read_tx_waveform_indices(tx_order)
+        with _profile("  read_waveforms"):
+            waveforms_one_way_list, waveforms_two_way_list = self.read_waveforms()
+        with _profile("  read_tx_waveform_indices"):
+            tx_waveform_indices = self.read_tx_waveform_indices(tx_order)
 
         # stack waveforms to (n_tx, n_samples) using the tx_waveform_indices
         waveforms_one_way = np.stack([waveforms_one_way_list[i] for i in tx_waveform_indices])
@@ -1398,17 +1612,21 @@ class VerasonicsFile(h5py.File):
         if frames is None:
             frames = convert_config.get("frames", "all")
 
-        scan_dict = self.read_scan(
-            frames=frames,
-            allow_accumulate=allow_accumulate,
-            buffer_index=buffer_index,
-        )
+        _timings = {}
 
-        raw_data = self.read_raw_data(
-            frames=frames,
-            buffer_index=buffer_index,
-            first_frame_idx=convert_config.get("first_frame", None),
-        )
+        with _profile("read_scan (delays, apod, timing, geometry)", _timings):
+            scan_dict = self.read_scan(
+                frames=frames,
+                allow_accumulate=allow_accumulate,
+                buffer_index=buffer_index,
+            )
+
+        with _profile("read_raw_data (RF read + reshape)", _timings):
+            raw_data = self.read_raw_data(
+                frames=frames,
+                buffer_index=buffer_index,
+                first_frame_idx=convert_config.get("first_frame", None),
+            )
 
         custom_elements = []
 
@@ -1583,27 +1801,34 @@ class VerasonicsFile(h5py.File):
             f"Reading Verasonics file (RF buffer index {buffer_index}, "
             f"image buffer index {image_buffer_index})..."
         )
-        data_dict, scan_dict, probe_dict, custom_elements = self.read_verasonics_file(
-            frames=frames,
-            allow_accumulate=allow_accumulate,
-            buffer_index=buffer_index,
-            additional_functions=additional_functions,
-            lens_sound_speed=lens_sound_speed,
-            image_buffer_index=image_buffer_index,
-        )
+        _total_start = time.perf_counter()
+        with _profile("read_verasonics_file (TOTAL metadata + RF read)"):
+            data_dict, scan_dict, probe_dict, custom_elements = self.read_verasonics_file(
+                frames=frames,
+                allow_accumulate=allow_accumulate,
+                buffer_index=buffer_index,
+                additional_functions=additional_functions,
+                lens_sound_speed=lens_sound_speed,
+                image_buffer_index=image_buffer_index,
+            )
 
         # Generate the zea dataset
         log.info("Generating zea dataset...")
         compression = DEFAULT_COMPRESSION if enable_compression else None
-        File.create(
-            path=output_path,
-            data=data_dict,
-            scan=scan_dict,
-            probe=probe_dict,
-            description="Verasonics data",
-            custom=custom_elements,
-            compression=compression,
-        )
+        with _profile("File.create (HDF5 write)"):
+            File.create(
+                path=output_path,
+                data=data_dict,
+                scan=scan_dict,
+                probe=probe_dict,
+                description="Verasonics data",
+                custom=custom_elements,
+                compression=compression,
+            )
+        if _PROFILE_ENABLED:
+            log.info(
+                f"[profile] to_zea TOTAL: {time.perf_counter() - _total_start:.3f} s"
+            )
 
 
 class VerasonicsProbe:
