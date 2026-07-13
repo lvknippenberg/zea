@@ -85,10 +85,11 @@ _FRAMES_RANGE_RE = re.compile(r"^\d+(-\d+)?$")
 
 
 # Lightweight profiling. Enable by setting the environment variable
-# ZEA_VERASONICS_PROFILE=1 (or true/yes). When enabled, the converter logs how
-# long each major stage takes, which helps locate bottlenecks (e.g. reading a
-# very large Receive/Event structure).
-_PROFILE_ENABLED = strtobool(os.environ.get("ZEA_VERASONICS_PROFILE", "0"))
+# ZEA_VERASONICS_PROFILE=1 (or true/yes). The flag is read at call time (not at
+# import time) so it works regardless of whether the environment variable is set
+# before or after this module is imported.
+def _profile_enabled():
+    return strtobool(os.environ.get("ZEA_VERASONICS_PROFILE", "0"))
 
 
 @contextmanager
@@ -100,7 +101,7 @@ def _profile(label, store=None):
         store (dict, optional): If given, the elapsed time is also recorded under
             ``store[label]`` so callers can build a summary.
     """
-    if not _PROFILE_ENABLED:
+    if not _profile_enabled():
         yield
         return
     start = time.perf_counter()
@@ -339,6 +340,49 @@ class VerasonicsFile(h5py.File):
             dereferenced_data.append(element)
         return dereferenced_data
 
+    def _read_scalar_field(self, group_name, field_name):
+        """Read every entry of a scalar struct-array field as one numpy array.
+
+        Many Verasonics struct-array fields (e.g. ``Receive.mode``,
+        ``Receive.framenum``, ``Event.tx``) are stored as an ``(N, 1)`` dataset of
+        HDF5 object references, each pointing to a ``(1, 1)`` scalar. The original
+        code dereferenced these one element at a time inside Python loops, which
+        for large structures (tens of thousands of entries) means tens of
+        thousands of individual HDF5 reads per field - and several of those
+        passes were repeated many times per conversion.
+
+        This helper performs the read once and memoizes the result on the
+        instance, so all callers share a single O(N) pass per field instead of
+        recomputing it. Non-reference (already-contiguous) datasets are returned
+        directly.
+
+        Returns:
+            np.ndarray: 1-D array with one value per struct-array entry.
+        """
+        cache = self.__dict__.setdefault("_scalar_field_cache", {})
+        key = (group_name, field_name)
+        if key in cache:
+            return cache[key]
+
+        dataset = self[group_name][field_name]
+        if isinstance(dataset.fillvalue, h5py.h5r.Reference):
+            references = np.asarray(dataset[:]).reshape(-1)
+            # Resolve each reference. h5py requires per-reference resolution, but
+            # we do it in a single tight pass and only once (then cache).
+            values = np.empty(references.size, dtype=np.float64)
+            file = self  # local ref for speed
+            for i, ref in enumerate(references):
+                values[i] = np.asarray(file[ref]).reshape(-1)[0]
+        else:
+            values = np.asarray(dataset[:]).reshape(-1).astype(np.float64)
+
+        cache[key] = values
+        return values
+
+    def _clear_scalar_field_cache(self):
+        """Clear the memoized scalar-field arrays (e.g. after reopening)."""
+        self.__dict__.pop("_scalar_field_cache", None)
+
     @staticmethod
     def get_reference_size(dataset):
         """Get the number of references in a reference dataset.
@@ -402,11 +446,10 @@ class VerasonicsFile(h5py.File):
                 "framenum) are present."
             )
 
-        bufnums = self.dereference_all(self["Receive"]["bufnum"])
-        # Each dereferenced element is a (1, 1) array; flatten to a scalar and
-        # convert from 1-based (Verasonics) to 0-based indexing.
-        bufnums = np.array([int(np.asarray(b).item()) - 1 for b in bufnums], dtype=np.int64)
-        return bufnums
+        # Bulk read all bufnum values in a single cached pass, then convert from
+        # 1-based (Verasonics) to 0-based indexing.
+        bufnums = self._read_scalar_field("Receive", "bufnum")
+        return np.round(bufnums).astype(np.int64) - 1
 
     def receive_indices_for_buffer(self, buffer_index=0):
         """Indices into the ``Receive`` array that belong to ``buffer_index``.
@@ -449,14 +492,6 @@ class VerasonicsFile(h5py.File):
 
         num_events = self["Event"]["info"].shape[0]
 
-        # In the Verasonics the transmits may not be in order in the TX structure and a
-        # transmit might be reused. Therefore, we need to keep track of the order in which
-        # the transmits appear in the Events.
-        tx_order = []
-        rcv_order = []
-        time_to_next_acq = []
-        modes = []
-
         frame_indices = self.get_frame_indices(frames, buffer_index)
 
         # Buffer index (0-based) of every Receive entry. Only events whose
@@ -465,81 +500,53 @@ class VerasonicsFile(h5py.File):
         # handled by selecting a single buffer.
         receive_bufnums = self.read_receive_bufnums()
 
-        for i in range(num_events):
-            # Get the tx
-            event_tx = self.dereference_index(self["Event"]["tx"], i)
-            event_tx = int(event_tx.item())
+        # Bulk-read the per-event and per-receive scalar fields in single cached
+        # passes instead of dereferencing each entry individually inside the loop
+        # (which is prohibitively slow for large Event/Receive structures).
+        event_tx_all = np.round(self._read_scalar_field("Event", "tx")).astype(np.int64)
+        event_rcv_all = np.round(self._read_scalar_field("Event", "rcv")).astype(np.int64)
+        receive_mode_all = np.round(self._read_scalar_field("Receive", "mode")).astype(np.int64)
+        receive_framenum_all = np.round(
+            self._read_scalar_field("Receive", "framenum")
+        ).astype(np.int64)
 
-            # Get the rcv
-            event_rcv = self.dereference_index(self["Event"]["rcv"], i)
-            event_rcv = int(event_rcv.item())
+        # An event contributes only if it has BOTH a transmit and a receive.
+        has_tx = event_tx_all != 0
+        has_rcv = event_rcv_all != 0
+        if np.any(has_tx != has_rcv):
+            log.warning(
+                "Some events have a transmit but no receive or vice versa; "
+                "these are skipped."
+            )
+        valid = has_tx & has_rcv
 
-            if not bool(event_tx) == bool(event_rcv):
-                log.warning(
-                    "Events should have both a transmit and a receive or neither. "
-                    f"Event {i} has a transmit but no receive or vice versa. Skipping it."
-                )
+        # 0-based tx/rcv indices for the valid events (order preserved).
+        event_indices = np.flatnonzero(valid)
+        tx_idx = event_tx_all[event_indices] - 1
+        rcv_idx = event_rcv_all[event_indices] - 1
 
-            # Only events that have *both* a transmit and a receive contribute to
-            # the transmit/receive ordering. Skip events without a transmit, and
-            # also events without a receive (e.g. transmit-only push/flash
-            # events): the latter have event_rcv == 0, which would otherwise
-            # become -1 below and index the Receive array out of range.
-            if not event_tx or not event_rcv:
-                continue
+        # Keep only events whose receive belongs to the selected buffer.
+        in_buffer = receive_bufnums[rcv_idx] == buffer_index
+        event_indices = event_indices[in_buffer]
+        tx_idx = tx_idx[in_buffer]
+        rcv_idx = rcv_idx[in_buffer]
 
-            # Subtract one to make the indices 0-based
-            event_tx -= 1
-            event_rcv -= 1
+        # Of those, the transmit/receive ordering uses only the first frame,
+        # assuming all frames share the same transmits and receives.
+        framenum = receive_framenum_all[rcv_idx]
+        first_frame = framenum == 1
+        tx_order = tx_idx[first_frame]
+        rcv_order = rcv_idx[first_frame]
+        modes = receive_mode_all[rcv_idx[first_frame]]
 
-            # Skip events whose receive is not stored in the selected RF buffer.
-            # This ensures that only the transmit/receive (and the corresponding
-            # seq_control) belonging to `buffer_index` are used.
-            if receive_bufnums[event_rcv] != buffer_index:
-                continue
+        # Collect the time-to-next-acquisition for every in-buffer transmit event
+        # (across all frames), preserving event order, exactly as before.
+        time_to_next_acq = self._collect_time_to_next_acq(event_indices)
 
-            # Read mode
-            mode = self.dereference_index(self["Receive"]["mode"], event_rcv)
-            mode = int(mode.item())
-
-            # Check in the Receive structure if this is still the first frame
-            framenum = self.dereference_index(self["Receive"]["framenum"], event_rcv)
-            framenum = self.cast_to_integer(framenum)
-
-            # Only add the event to the list if it is the first frame since we assume
-            # that all frames have the same transmits and receives
-            if framenum == 1:
-                # Add the event to the list
-                tx_order.append(event_tx)
-                rcv_order.append(event_rcv)
-                modes.append(mode)
-
-            # Read the time_to_next_acq
-            seq_control_indices = self.dereference_index(self["Event"]["seqControl"], i)
-
-            for seq_control_index in seq_control_indices:
-                seq_control_index = int(seq_control_index.item() - 1)
-                # A seqControl entry of 0 (-> -1 after the 0-based shift) means the
-                # event has no seq control at this position; skip it rather than
-                # indexing the SeqControl array out of range.
-                if seq_control_index < 0:
-                    continue
-                seq_control = self.dereference_index(
-                    self["SeqControl"]["command"], seq_control_index
-                )
-                # Decode the seq_control int array into a string
-                seq_control = self.decode_string(seq_control)
-                if seq_control == "timeToNextAcq":
-                    value = self.dereference_index(
-                        self["SeqControl"]["argument"], seq_control_index
-                    ).item()
-                    value = value * 1e-6
-                    time_to_next_acq.append(value)
-
-        modes = np.stack(modes)
-        tx_order = np.stack(tx_order)
-        rcv_order = np.stack(rcv_order)
-        time_to_next_acq = np.stack(time_to_next_acq)
+        tx_order = np.asarray(tx_order)
+        rcv_order = np.asarray(rcv_order)
+        modes = np.asarray(modes)
+        time_to_next_acq = np.asarray(time_to_next_acq)
 
         if np.any(modes == 1) and not allow_accumulate:
             raise ValueError(
@@ -588,6 +595,64 @@ class VerasonicsFile(h5py.File):
                 time_to_next_acq = None
 
         return tx_order, rcv_order, time_to_next_acq
+
+    def _collect_time_to_next_acq(self, event_indices):
+        """Collect ``timeToNextAcq`` values for the given events, in order.
+
+        Reproduces the original per-event, per-seqControl traversal: for each
+        event in ``event_indices`` (already filtered to valid, in-buffer events
+        and in event order), walk that event's ``seqControl`` entries in order
+        and append the argument of every ``timeToNextAcq`` command (converted
+        from microseconds to seconds).
+
+        The SeqControl table is small, so its command strings and arguments are
+        decoded once up front; only the per-event ``seqControl`` index lists are
+        read from the (larger) Event structure.
+        """
+        seq_control_dataset = self["Event"]["seqControl"]
+
+        # Pre-decode the (small) SeqControl table once: which entries are
+        # timeToNextAcq, and their argument values in seconds.
+        n_seq = self.get_reference_size(self["SeqControl"]["command"])
+        is_ttna = np.zeros(n_seq, dtype=bool)
+        ttna_value = np.zeros(n_seq, dtype=np.float64)
+        for j in range(n_seq):
+            command = self.decode_string(
+                self.dereference_index(self["SeqControl"]["command"], j)
+            )
+            if command == "timeToNextAcq":
+                is_ttna[j] = True
+                ttna_value[j] = (
+                    np.asarray(
+                        self.dereference_index(self["SeqControl"]["argument"], j)
+                    ).reshape(-1)[0]
+                    * 1e-6
+                )
+
+        # Bulk-read the per-event seqControl references once. Each event's
+        # seqControl is typically a scalar index but can be a short vector.
+        if isinstance(seq_control_dataset.fillvalue, h5py.h5r.Reference):
+            seq_refs = np.asarray(seq_control_dataset[:]).reshape(-1)
+            resolve = self
+        else:
+            seq_refs = None
+
+        time_to_next_acq = []
+        for i in event_indices:
+            if seq_refs is not None:
+                seq_control_indices = np.asarray(resolve[seq_refs[int(i)]]).reshape(-1)
+            else:
+                seq_control_indices = np.asarray(
+                    self.dereference_index(seq_control_dataset, int(i))
+                ).reshape(-1)
+            for raw in seq_control_indices:
+                seq_control_index = int(raw) - 1  # 0-based; 0 -> -1 means "none"
+                if seq_control_index < 0:
+                    continue
+                if is_ttna[seq_control_index]:
+                    time_to_next_acq.append(ttna_value[seq_control_index])
+
+        return time_to_next_acq
 
     def read_t0_delays_apod(self, tx_order):
         """
@@ -735,7 +800,7 @@ class VerasonicsFile(h5py.File):
                 for receive events belonging to this (0-based) RF buffer. If
                 ``None`` (default), return the values for all receive events.
         """
-        end_samples = np.concatenate(self.dereference_all(self["Receive"]["endSample"])).squeeze()
+        end_samples = self._read_scalar_field("Receive", "endSample")
         if buffer_index is not None:
             end_samples = end_samples[self.receive_indices_for_buffer(buffer_index)]
         return end_samples
@@ -748,9 +813,7 @@ class VerasonicsFile(h5py.File):
                 for receive events belonging to this (0-based) RF buffer. If
                 ``None`` (default), return the values for all receive events.
         """
-        start_samples = np.concatenate(
-            self.dereference_all(self["Receive"]["startSample"])
-        ).squeeze()
+        start_samples = self._read_scalar_field("Receive", "startSample")
         if buffer_index is not None:
             start_samples = start_samples[self.receive_indices_for_buffer(buffer_index)]
         return start_samples
@@ -1182,7 +1245,7 @@ class VerasonicsFile(h5py.File):
                 belonging to this (0-based) RF buffer. If ``None`` (default), all
                 receive events are considered.
         """
-        demod_freq = np.asarray(self.dereference_all(self["Receive"]["demodFrequency"])).squeeze()
+        demod_freq = self._read_scalar_field("Receive", "demodFrequency")
         demod_freq = np.atleast_1d(demod_freq)
         if buffer_index is not None:
             demod_freq = demod_freq[self.receive_indices_for_buffer(buffer_index)]
@@ -1310,12 +1373,28 @@ class VerasonicsFile(h5py.File):
         """
         SUPPORTED_SAMPLE_MODES = ["NS200BW", "BS100BW", "BS67BW", "BS50BW"]
 
-        # For all sample modes
-        sample_modes = self.dereference_all(self["Receive"]["sampleMode"], func=self.decode_string)
+        # Cache the decoded sample-mode result per buffer on the instance. The
+        # sampleMode field is stored as one HDF5 object reference per receive
+        # entry (each a short string), so decoding all of them is expensive for
+        # large Receive structures. We therefore (a) only decode the receives
+        # belonging to the requested buffer, and (b) memoize the final integer
+        # result so repeated callers (get_sampling_frequency, get_tgc_gain_curve,
+        # the scan dict) share a single computation.
+        result_cache = self.__dict__.setdefault("_sample_mode_result_cache", {})
+        if buffer_index in result_cache:
+            return result_cache[buffer_index]
+
+        sample_mode_dataset = self["Receive"]["sampleMode"]
         if buffer_index is not None:
             indices = self.receive_indices_for_buffer(buffer_index)
-            sample_modes = [sample_modes[i] for i in indices]
-        sample_mode = set(sample_modes)
+        else:
+            indices = range(self.get_reference_size(sample_mode_dataset))
+
+        sample_mode = set()
+        for i in indices:
+            sample_mode.add(
+                self.decode_string(self.dereference_index(sample_mode_dataset, int(i)))
+            )
 
         # Ensure only a single sample mode is used
         assert len(sample_mode) == 1, (
@@ -1328,7 +1407,9 @@ class VerasonicsFile(h5py.File):
             f"Unexpected sample mode '{sample_mode}' in file."
             f"Expected one of {SUPPORTED_SAMPLE_MODES}"
         )
-        return int(sample_mode[2:-2])
+        result = int(sample_mode[2:-2])
+        result_cache[buffer_index] = result
+        return result
 
     @property
     def sample_mode(self):
@@ -1542,30 +1623,46 @@ class VerasonicsFile(h5py.File):
             tx_waveform_indices = self.read_tx_waveform_indices(tx_order)
 
         # stack waveforms to (n_tx, n_samples) using the tx_waveform_indices
-        waveforms_one_way = np.stack([waveforms_one_way_list[i] for i in tx_waveform_indices])
-        waveforms_two_way = np.stack([waveforms_two_way_list[i] for i in tx_waveform_indices])
+        with _profile("  stack waveforms"):
+            waveforms_one_way = np.stack(
+                [waveforms_one_way_list[i] for i in tx_waveform_indices]
+            )
+            waveforms_two_way = np.stack(
+                [waveforms_two_way_list[i] for i in tx_waveform_indices]
+            )
 
-        center_frequency = self.read_center_frequencies(tx_waveform_indices)
-        focus_distances = self.planewave_focal_distance_to_inf(
-            focus_distances, t0_delays, tx_apodizations
-        )
+        with _profile("  read_center_frequencies"):
+            center_frequency = self.read_center_frequencies(tx_waveform_indices)
+        with _profile("  planewave_focal_distance_to_inf"):
+            focus_distances = self.planewave_focal_distance_to_inf(
+                focus_distances, t0_delays, tx_apodizations
+            )
+
+        with _profile("  get_sampling_frequency"):
+            sampling_frequency = self.get_sampling_frequency(buffer_index)
+        with _profile("  get_demodulation_frequency"):
+            demodulation_frequency = self.get_demodulation_frequency(buffer_index)
+        with _profile("  sound_speed"):
+            sound_speed = self.sound_speed
+        with _profile("  get_tgc_gain_curve"):
+            tgc_gain_curve = self.get_tgc_gain_curve(buffer_index)
 
         return {
             "time_to_next_transmit": time_to_next_transmit,
             "t0_delays": t0_delays,
             "tx_apodizations": tx_apodizations,
-            "sampling_frequency": self.get_sampling_frequency(buffer_index),
+            "sampling_frequency": sampling_frequency,
             "polar_angles": polar_angles,
             "azimuth_angles": azimuth_angles,
             "center_frequency": center_frequency,
-            "demodulation_frequency": self.get_demodulation_frequency(buffer_index),
-            "sound_speed": self.sound_speed,
+            "demodulation_frequency": demodulation_frequency,
+            "sound_speed": sound_speed,
             "initial_times": initial_times,
             "focus_distances": focus_distances,
             "transmit_origins": transmit_origins,
             "waveforms_one_way": waveforms_one_way,
             "waveforms_two_way": waveforms_two_way,
-            "tgc_gain_curve": self.get_tgc_gain_curve(buffer_index),
+            "tgc_gain_curve": tgc_gain_curve,
         }
 
     def read_verasonics_file(
@@ -1825,7 +1922,7 @@ class VerasonicsFile(h5py.File):
                 custom=custom_elements,
                 compression=compression,
             )
-        if _PROFILE_ENABLED:
+        if _profile_enabled():
             log.info(
                 f"[profile] to_zea TOTAL: {time.perf_counter() - _total_start:.3f} s"
             )
