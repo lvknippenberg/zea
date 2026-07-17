@@ -340,6 +340,30 @@ class VerasonicsFile(h5py.File):
             dereferenced_data.append(element)
         return dereferenced_data
 
+    # Several Verasonics fields are constant within a buffer (sampleMode,
+    # demodFrequency, sampling/decimation settings, ...) but are nonetheless
+    # stored as one HDF5 object reference per Receive entry. Reading every entry
+    # to discover a single value costs thousands of individual reads. Instead we
+    # verify constancy from a bounded, evenly-spread subset. Set to 0 to check
+    # every entry (slow, but exhaustive).
+    CONSTANT_FIELD_CHECK_SAMPLES = 32
+
+    @staticmethod
+    def _subset_indices(indices, n_samples):
+        """Evenly-spread subset of ``indices``, always including first and last.
+
+        Used to spot-check fields that are constant within a buffer. Returns all
+        indices when ``n_samples`` is 0 or exceeds the number available, so the
+        exhaustive behaviour is always one setting away.
+        """
+        indices = np.asarray(indices).reshape(-1)
+        if n_samples <= 0 or indices.size <= n_samples:
+            return indices
+        picks = np.unique(
+            np.linspace(0, indices.size - 1, n_samples).round().astype(int)
+        )
+        return indices[picks]
+
     def _read_scalar_field(self, group_name, field_name):
         """Read every entry of a scalar struct-array field as one numpy array.
 
@@ -702,7 +726,9 @@ class VerasonicsFile(h5py.File):
         if buffer_index is not None:
             rcv_idx = int(self.receive_indices_for_buffer(buffer_index)[0])
 
-        # Read the sampling frequency from the file
+        # decimSampleRate and quadDecim are constant within a buffer (see the
+        # assumption warned about in to_zea), so a single receive is read rather
+        # than dereferencing one entry per receive.
         adc_rate = self.dereference_index(self["Receive"]["decimSampleRate"], rcv_idx)
 
         if "quadDecim" in self["Receive"]:
@@ -981,6 +1007,24 @@ class VerasonicsFile(h5py.File):
                 available.append(i)
         return available
 
+    def available_buffers(self):
+        """0-based indices of the RF buffers actually present in this file.
+
+        Unifies the two storage forms:
+
+        * RF stored **in** the ``.mat``: every ``RcvData`` cell is a buffer.
+        * RF stored in **external binaries**: only the buffers that were saved
+          have an ``RF_data_{k}.bin``. A buffer may exist on the system yet not
+          be written for a given measurement, so a missing file means "not
+          saved", not "empty".
+
+        Returns:
+            list[int]: 0-based buffer indices. Add 1 for MATLAB ``RcvData{k}``.
+        """
+        if self.has_rcvdata:
+            return list(range(self.get_reference_size(self["RcvData"])))
+        return self.available_binary_buffers()
+
     def _read_rf_dimension(self, name, buffer_index):
         """Read entry ``buffer_index`` from a ``(1, N)`` RF dimension array."""
         if name not in self:
@@ -1240,22 +1284,49 @@ class VerasonicsFile(h5py.File):
     def get_demodulation_frequency(self, buffer_index=None):
         """Demodulation frequency of the probe from the file in Hz.
 
+        The demodulation frequency is constant within a buffer, but is stored as
+        one HDF5 object reference per Receive entry. Rather than dereferencing
+        every entry (thousands of reads for one value), we verify constancy from
+        a bounded subset - see ``CONSTANT_FIELD_CHECK_SAMPLES``.
+
         Args:
             buffer_index (int, optional): If given, only consider receive events
                 belonging to this (0-based) RF buffer. If ``None`` (default), all
                 receive events are considered.
         """
-        demod_freq = self._read_scalar_field("Receive", "demodFrequency")
-        demod_freq = np.atleast_1d(demod_freq)
+        result_cache = self.__dict__.setdefault("_demod_freq_result_cache", {})
+        if buffer_index in result_cache:
+            return result_cache[buffer_index]
+
+        dataset = self["Receive"]["demodFrequency"]
         if buffer_index is not None:
-            demod_freq = demod_freq[self.receive_indices_for_buffer(buffer_index)]
-        demod_freq = np.unique(demod_freq)
+            indices = np.asarray(self.receive_indices_for_buffer(buffer_index))
+        else:
+            indices = np.arange(self.get_reference_size(dataset))
+
+        if indices.size == 0:
+            raise ValueError(
+                f"No Receive entries found for buffer_index={buffer_index}; cannot "
+                "determine the demodulation frequency."
+            )
+
+        probe = self._subset_indices(indices, self.CONSTANT_FIELD_CHECK_SAMPLES)
+        values = np.array(
+            [
+                float(np.asarray(self.dereference_index(dataset, int(i))).reshape(-1)[0])
+                for i in probe
+            ]
+        )
+
+        demod_freq = np.unique(values)
         assert demod_freq.size == 1, (
             f"Multiple demodulation frequencies found in file: {demod_freq}. "
             "We do not support this case."
         )
 
-        return demod_freq.item() * 1e6
+        result = demod_freq.item() * 1e6
+        result_cache[buffer_index] = result
+        return result
 
     @property
     def demodulation_frequency(self):
@@ -1386,12 +1457,27 @@ class VerasonicsFile(h5py.File):
 
         sample_mode_dataset = self["Receive"]["sampleMode"]
         if buffer_index is not None:
-            indices = self.receive_indices_for_buffer(buffer_index)
+            indices = np.asarray(self.receive_indices_for_buffer(buffer_index))
         else:
-            indices = range(self.get_reference_size(sample_mode_dataset))
+            indices = np.arange(self.get_reference_size(sample_mode_dataset))
+
+        if indices.size == 0:
+            raise ValueError(
+                f"No Receive entries found for buffer_index={buffer_index}; cannot "
+                "determine the sample mode."
+            )
+
+        # sampleMode is constant within a buffer, but it is stored as one HDF5
+        # object reference *per receive entry*. Decoding every entry therefore
+        # costs thousands of individual reads to learn a single value. Instead we
+        # check a bounded, evenly-spread subset (always including the first and
+        # last entry): enough to catch a genuinely non-uniform file, at a tiny
+        # fraction of the cost. Set CONSTANT_FIELD_CHECK_SAMPLES to 0 to check
+        # every entry.
+        probe = self._subset_indices(indices, self.CONSTANT_FIELD_CHECK_SAMPLES)
 
         sample_mode = set()
-        for i in indices:
+        for i in probe:
             sample_mode.add(
                 self.decode_string(self.dereference_index(sample_mode_dataset, int(i)))
             )
@@ -1898,6 +1984,18 @@ class VerasonicsFile(h5py.File):
             f"Reading Verasonics file (RF buffer index {buffer_index}, "
             f"image buffer index {image_buffer_index})..."
         )
+        log.warning(
+            "ASSUMPTION: all receives within an RF buffer are assumed to share the "
+            "same acquisition settings - sample mode, demodulation frequency, "
+            "sampling rate (decimSampleRate / quadDecim) and start/end depth. "
+            "These are read from, or spot-checked on, a subset of the buffer's "
+            "receives rather than every one, because they are stored per-receive "
+            "but are constant by construction. If a sequence varies any of these "
+            "*within* a single buffer, the converted parameters will be wrong. "
+            f"(Constancy is verified on up to {self.CONSTANT_FIELD_CHECK_SAMPLES} "
+            "receives per buffer; set VerasonicsFile.CONSTANT_FIELD_CHECK_SAMPLES = 0 "
+            "to check every receive exhaustively.)"
+        )
         _total_start = time.perf_counter()
         with _profile("read_verasonics_file (TOTAL metadata + RF read)"):
             data_dict, scan_dict, probe_dict, custom_elements = self.read_verasonics_file(
@@ -1926,6 +2024,85 @@ class VerasonicsFile(h5py.File):
             log.info(
                 f"[profile] to_zea TOTAL: {time.perf_counter() - _total_start:.3f} s"
             )
+
+    def to_zea_all(
+        self,
+        output_dir,
+        buffers=None,
+        stem=None,
+        overwrite=False,
+        on_error="warn",
+        **to_zea_kwargs,
+    ):
+        """Convert several RF buffers of this file, one zea HDF5 per buffer.
+
+        Prefer this over calling :meth:`to_zea` in a loop over freshly-opened
+        files. The bulk of a conversion's cost is reading the shared
+        ``Receive``/``Event`` structures, which can hold tens of thousands of
+        entries; those reads are memoised on the instance. Converting every
+        buffer from a single open file therefore pays that cost once, whereas
+        re-opening the file per buffer repeats it every time.
+
+        Args:
+            output_dir (str | Path): Directory to write the HDF5 files into.
+            buffers (list[int], optional): 0-based buffer indices to convert.
+                Defaults to every buffer present (see :meth:`available_buffers`).
+            stem (str, optional): Base name for the outputs. Defaults to the
+                ``.mat`` file's stem. Files are named ``{stem}_buffer{k}.hdf5``
+                with ``k`` the 1-based MATLAB buffer number, so they line up with
+                ``RcvData{k}``.
+            overwrite (bool): Re-convert buffers whose output already exists.
+            on_error ({"warn", "raise"}): Whether a failure on one buffer should
+                abort the whole run or be logged and skipped. Defaults to
+                ``"warn"``, so that one bad buffer does not lose the others.
+            **to_zea_kwargs: Passed through to :meth:`to_zea` (e.g.
+                ``allow_accumulate``, ``enable_compression``,
+                ``image_buffer_index``).
+
+        Returns:
+            dict[int, Path | None]: Output path per 0-based buffer index;
+            ``None`` for buffers that failed.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = stem or Path(self.filename).stem
+
+        present = self.available_buffers()
+        wanted = present if buffers is None else list(buffers)
+
+        log.info(
+            f"Converting buffers (MATLAB) {[b + 1 for b in wanted]} of "
+            f"{[b + 1 for b in present]} present in {Path(self.filename).name}"
+        )
+
+        results = {}
+        for buffer_index in wanted:
+            k = buffer_index + 1
+            out = output_dir / f"{stem}_buffer{k}.hdf5"
+
+            if buffer_index not in present:
+                log.warning(f"  buffer {k}: not present / not saved - skipping")
+                results[buffer_index] = None
+                continue
+
+            if out.is_file() and not overwrite:
+                log.info(f"  buffer {k}: already converted -> {out.name}")
+                results[buffer_index] = out
+                continue
+
+            if out.is_file():
+                out.unlink()
+
+            try:
+                self.to_zea(str(out), buffer_index=buffer_index, **to_zea_kwargs)
+                results[buffer_index] = out
+            except Exception as exc:
+                if on_error == "raise":
+                    raise
+                log.error(f"  buffer {k}: FAILED - {type(exc).__name__}: {exc}")
+                results[buffer_index] = None
+
+        return results
 
 
 class VerasonicsProbe:
