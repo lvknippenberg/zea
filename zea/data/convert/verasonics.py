@@ -25,15 +25,20 @@ Then convert the saved `raw_data.mat` file to zea format using the following cod
 
         from zea.data.convert.verasonics import VerasonicsFile
 
+        # A single-buffer file -> one zea .hdf5:
         VerasonicsFile("C:/path/to/raw_data.mat").to_zea("C:/path/to/output.hdf5")
 
-Or alternatively, use the script below to convert all .mat files in a directory:
+        # A multi-buffer file -> one zea .hdf5 per RF buffer:
+        with VerasonicsFile("C:/path/to/raw_data.mat") as vf:
+            vf.to_zea_all("C:/path/to/output_dir")
+
+Or alternatively, use the CLI to convert all .mat files in a directory:
 
     .. code-block:: bash
 
-        python zea/data/convert/verasonics.py "C:/path/to/directory"
+        python -m zea.data.convert verasonics "C:/path/to/directory" "C:/path/to/output_dir"
 
-or without the directory argument, the script will prompt you to select a directory
+or without the source argument, the CLI will prompt you to select a directory
 using a file dialog.
 
 ---------------
@@ -513,8 +518,6 @@ class VerasonicsFile(h5py.File):
                 rcv_order (list): The order in which the receives appear in the events.
                 time_to_next_acq (np.ndarray): The time to next acquisition of shape (n_acq, n_tx).
         """
-
-        num_events = self["Event"]["info"].shape[0]
 
         frame_indices = self.get_frame_indices(frames, buffer_index)
 
@@ -1170,31 +1173,25 @@ class VerasonicsFile(h5py.File):
             f"(n_frames, n_channels, n_samples), but got {raw_data.shape}."
         )
 
-        # Reorder and select channels based on probe elements.
+        # Select the probe-element channels out of the acquired hardware channels.
         #
-        # Verasonics acquires on all hardware receive channels (e.g. 128), which
-        # for a probe with fewer elements (e.g. 80) means the raw data has more
-        # channels than the probe has elements. The probe's ``ConnectorES`` map
-        # (exposed as ``self.probe.connector``) selects, for each element, the
-        # hardware channel it was acquired on, reconciling the raw-data channel
-        # count with the element count used by t0_delays / apodization.
-        #
-        # This selection must happen whenever the raw channel count does not
-        # already match the number of probe elements. The older code only did it
-        # for files saved with the updated ``save_raw`` function (>= 1.0), which
-        # left files without that flag with a channel/element mismatch
-        # (e.g. "Dimension 'n_el' has inconsistent sizes: 80 vs 128").
+        # Verasonics acquires on all hardware channels (e.g. 128); for a probe
+        # with fewer elements (e.g. 80) the raw data thus has more channels than
+        # elements. ``Trans.ConnectorES`` (self.probe.connector) maps each element
+        # to the hardware channel it was acquired on, matching the raw-data channel
+        # count to the element count used by t0_delays / apodization. We apply it
+        # whenever the counts differ. (The older code applied it only for the
+        # updated ``save_raw`` format, leaving other files with an 80-vs-128
+        # mismatch downstream.)
         n_channels = raw_data.shape[1]
         connector = self.probe.connector
         n_elements = self.probe.geometry.shape[0]
 
         if n_channels == n_elements and not self.is_new_save_raw_format:
-            # Channel count already matches the elements and the data was not
-            # saved with the updated save_raw (which always reorders): assume the
-            # channel order already matches the probe element order.
+            # Counts already match and save_raw did not reorder: assume the
+            # channel order already matches the element order.
             pass
         elif connector is not None and connector.size == n_elements:
-            # Map the acquired hardware channels down to the probe elements.
             if connector.min() < 0 or connector.max() >= n_channels:
                 raise ValueError(
                     "Cannot map acquired channels to probe elements: connector "
@@ -1349,18 +1346,31 @@ class VerasonicsFile(h5py.File):
         Returns:
             np.ndarray: The initial times of shape ``(n_rcv,)``.
         """
+        # wavelength / sound_speed is constant across receives (and each access
+        # re-reads HDF5), so hoist it out of the loop.
+        depth_to_time = self.wavelength / self.sound_speed
         initial_times = []
         for n in rcv_order:
             start_depth = self.dereference_index(self["Receive"]["startDepth"], n).item()
 
-            initial_times.append(2 * start_depth * self.wavelength / self.sound_speed)
+            initial_times.append(2 * start_depth * depth_to_time)
 
         return np.stack(initial_times).astype(np.float32)
 
     @property
     def probe(self) -> "VerasonicsProbe":
-        """The probe object from the file."""
-        return VerasonicsProbe(self)
+        """The probe object from the file.
+
+        Cached on the instance: the probe describes the transducer (Trans), which
+        is global to the file rather than per-buffer, so it is built once and
+        reused. Accessors like ``self.wavelength`` hit this on every transmit, and
+        rebuilding it each time re-reads ``Trans`` from HDF5 (and re-emits the
+        unknown-probe warning).
+        """
+        cache = self.__dict__
+        if "_probe" not in cache:
+            cache["_probe"] = VerasonicsProbe(self)
+        return cache["_probe"]
 
     def read_focus_distances(self, tx_order):
         """Reads the focus distances from the file.
@@ -1444,13 +1454,10 @@ class VerasonicsFile(h5py.File):
         """
         SUPPORTED_SAMPLE_MODES = ["NS200BW", "BS100BW", "BS67BW", "BS50BW"]
 
-        # Cache the decoded sample-mode result per buffer on the instance. The
-        # sampleMode field is stored as one HDF5 object reference per receive
-        # entry (each a short string), so decoding all of them is expensive for
-        # large Receive structures. We therefore (a) only decode the receives
-        # belonging to the requested buffer, and (b) memoize the final integer
-        # result so repeated callers (get_sampling_frequency, get_tgc_gain_curve,
-        # the scan dict) share a single computation.
+        # sampleMode is stored as one HDF5 object reference per receive entry, so
+        # decoding it is expensive for large Receive structures. Memoize the final
+        # integer result per buffer so repeated callers (get_sampling_frequency,
+        # get_tgc_gain_curve, the scan dict) share one computation.
         result_cache = self.__dict__.setdefault("_sample_mode_result_cache", {})
         if buffer_index in result_cache:
             return result_cache[buffer_index]
@@ -1467,13 +1474,10 @@ class VerasonicsFile(h5py.File):
                 "determine the sample mode."
             )
 
-        # sampleMode is constant within a buffer, but it is stored as one HDF5
-        # object reference *per receive entry*. Decoding every entry therefore
-        # costs thousands of individual reads to learn a single value. Instead we
-        # check a bounded, evenly-spread subset (always including the first and
-        # last entry): enough to catch a genuinely non-uniform file, at a tiny
-        # fraction of the cost. Set CONSTANT_FIELD_CHECK_SAMPLES to 0 to check
-        # every entry.
+        # sampleMode is constant within a buffer, so rather than decode every
+        # entry we check a bounded, evenly-spread subset (always including the
+        # first and last) - enough to catch a non-uniform file at a fraction of
+        # the cost. Set CONSTANT_FIELD_CHECK_SAMPLES to 0 to check every entry.
         probe = self._subset_indices(indices, self.CONSTANT_FIELD_CHECK_SAMPLES)
 
         sample_mode = set()
@@ -1692,10 +1696,13 @@ class VerasonicsFile(h5py.File):
         with _profile("  read_initial_times"):
             initial_times = self.read_initial_times(rcv_order)
 
-        with _profile("  read_polar_angles"):
-            polar_angles = self.read_polar_angles(tx_order)
-        with _profile("  read_azimuth_angles"):
-            azimuth_angles = self.read_azimuth_angles(tx_order)
+        # Read both steering angles in a single pass. read_polar_angles and
+        # read_azimuth_angles would each re-run the full per-transmit dereference
+        # loop over TX.Steer; reading (theta, alpha) once and slicing halves it.
+        with _profile("  read_beamsteering_angles"):
+            beamsteering_angles = self.read_beamsteering_angles(tx_order)
+            polar_angles = beamsteering_angles[:, 0]
+            azimuth_angles = beamsteering_angles[:, 1]
         with _profile("  read_t0_delays_apod"):
             t0_delays, tx_apodizations = self.read_t0_delays_apod(tx_order)
         with _profile("  read_focus_distances"):
@@ -2178,9 +2185,10 @@ class VerasonicsProbe:
     @property
     def bandwidth_percent(self):
         """Bandwidth of the probe as a percentage of the center frequency."""
-        if self.bandwidth is not None:
-            assert self.bandwidth[1] > self.bandwidth[0], "Bandwidth must be positive"
-            diff = self.bandwidth[1] - self.bandwidth[0]
+        bandwidth = self.bandwidth
+        if bandwidth is not None:
+            assert bandwidth[1] > bandwidth[0], "Bandwidth must be positive"
+            diff = bandwidth[1] - bandwidth[0]
             return 100 * (diff / self.center_frequency)
 
     @property
